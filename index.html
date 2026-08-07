@@ -2015,6 +2015,14 @@ document.addEventListener('click', function(e){
   setInterval(async ()=>{
     if(document.getElementById('answerBox')) return; // don't yank state while someone is mid-answer
     if(IS_MUTATING) return; // don't read while a save is in flight — avoids racing/overwriting it
+    // don't yank state (and wipe what's typed) while the user is actively focused on ANY
+    // text field — forum message, participant names, admin codes, question text, etc.
+    // This covers every current and future input without having to list each id here.
+    const active = document.activeElement;
+    if(active && document.body.contains(active)){
+      const tag = active.tagName;
+      if(tag==='INPUT' || tag==='TEXTAREA' || active.isContentEditable) return;
+    }
     try{
       const r = await window.storage.get('tournament', true);
       if(r && r.value) STATE = JSON.parse(r.value);
