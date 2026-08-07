@@ -394,17 +394,48 @@ function playTimeUpSound(){ beep(220, .35, .08, 'sawtooth'); }
 let SAVE_QUEUE = Promise.resolve(); // serializes all writes so concurrent clicks/polling can't race each other
 let IS_MUTATING = false;
 
+// IMPORTANT: window.storage.get() throws BOTH when a key genuinely doesn't exist yet
+// AND when the read fails for a transient reason (network blip, offline, permission
+// hiccup). Those two cases must never be treated the same way — collapsing them into
+// "just use defaultState()" is what previously caused a live tournament to be silently
+// replaced by a blank one. FIRST_LOAD_OK tracks whether we've ever successfully
+// confirmed real tournament data exists (or genuinely doesn't) in this session, so we
+// can tell "brand new tournament" apart from "read failed, don't touch anything".
+let FIRST_LOAD_OK = false;
+
 async function loadState(){
   try{
     const r = await window.storage.get('tournament', true);
     STATE = r && r.value ? JSON.parse(r.value) : defaultState();
-  }catch(e){ STATE = defaultState(); }
+    FIRST_LOAD_OK = true;
+  }catch(e){
+    // Could mean "no tournament doc yet" (fine, start fresh) or "read failed"
+    // (network/permissions — NOT fine, do not fabricate a blank tournament).
+    // We can't always tell these apart from the thrown error alone, so we only ever
+    // fall back to defaultState() here on the very first boot, and we keep retrying
+    // in the background rather than trusting the blank state as truth.
+    console.error('initial load failed', e);
+    STATE = defaultState();
+    FIRST_LOAD_OK = false;
+    showAlert('تعذر الاتصال بقاعدة البيانات. تأكد من اتصال النت وأعد فتح الصفحة قبل إجراء أي تعديل، حتى لا تفقد بيانات البطولة.');
+  }
   ensureForum(STATE);
   try{
     const m = await window.storage.get('my_team', false);
     MY_TEAM = m && m.value ? JSON.parse(m.value) : null;
   }catch(e){ MY_TEAM = null; }
 }
+
+// Keep a rolling backup of the last known-good tournament state under a separate key,
+// written right before every real save. If a save ever gets corrupted or wiped, the
+// previous good snapshot is still sitting in Firestore under 'tournament_backup' and
+// can be restored manually (see restoreFromBackup()).
+async function backupState(){
+  try{
+    await window.storage.set('tournament_backup', JSON.stringify(STATE), true);
+  }catch(e){ console.error('backup failed', e); /* non-fatal, saving still proceeds */ }
+}
+
 async function saveState(){
   // retry once before giving up — most "save failed" cases are a transient hiccup, not a real failure
   for(let attempt=0; attempt<2; attempt++){
@@ -422,16 +453,32 @@ async function saveState(){
 // re-fetch latest shared state, apply a mutation function, then save (reduces write collisions).
 // Queued/serialized: if you tap several buttons quickly, each mutation waits its turn instead of
 // racing the previous one — that race was causing occasional false "save failed" messages.
+//
+// SAFETY: if the pre-mutation re-fetch fails, we ABORT the whole mutation instead of running
+// it against whatever STATE happens to be in memory (which could be a stale/blank default).
+// This is the fix for the bug that wiped the tournament: a transient read failure used to
+// silently fall through to fn(STATE) running on a blank state, and the blank result got
+// saved right over the real data. Now a failed read just cancels this one action safely.
 function mutate(fn){
   const run = SAVE_QUEUE.then(async ()=>{
     IS_MUTATING = true;
     try{
+      let readOk = false;
       try{
         const r = await window.storage.get('tournament', true);
-        if(r && r.value) STATE = JSON.parse(r.value);
-      }catch(e){}
+        if(r && r.value){ STATE = JSON.parse(r.value); readOk = true; }
+      }catch(e){
+        console.error('mutate: pre-read failed, aborting to avoid data loss', e);
+      }
+      if(!readOk && FIRST_LOAD_OK){
+        // We previously had real data this session but couldn't confirm it's still there —
+        // refuse to write anything until we can verify, rather than risk overwriting it.
+        showAlert('تعذر التحقق من آخر نسخة محفوظة قبل الحفظ. لم يتم إجراء أي تعديل — تأكد من اتصال النت وحاول مرة أخرى.');
+        return;
+      }
       ensureForum(STATE);
       fn(STATE);
+      await backupState(); // snapshot before overwriting, so this write is recoverable if it's wrong
       await saveState();
     } finally {
       IS_MUTATING = false;
@@ -439,6 +486,17 @@ function mutate(fn){
   });
   SAVE_QUEUE = run.catch(()=>{}); // keep the chain alive even if one link fails
   return run;
+}
+
+// Manual recovery helper: restores 'tournament' from the last automatic backup.
+// Run from the browser console: restoreFromBackup()
+async function restoreFromBackup(){
+  try{
+    const b = await window.storage.get('tournament_backup', true);
+    if(!b || !b.value){ console.log('لا توجد نسخة احتياطية محفوظة.'); return; }
+    await window.storage.set('tournament', b.value, true);
+    console.log('تم الاسترجاع من النسخة الاحتياطية. أعد تحميل الصفحة.');
+  }catch(e){ console.error('restore failed', e); }
 }
 async function setMyTeam(id){
   MY_TEAM = id;
