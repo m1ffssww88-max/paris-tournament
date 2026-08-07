@@ -924,6 +924,7 @@ async function bodyFor(screen){
     case 'admin-teams': return screenAdminTeams();
     case 'admin-draw-r1': return screenAdminDrawR1();
     case 'admin-round': return screenAdminRound();
+    case 'admin-rearrange-round': return screenAdminRearrangeRound();
     case 'admin-match': return screenAdminMatch();
     case 'admin-grade': return screenAdminGrade();
     case 'admin-knockout': return screenAdminKnockout();
@@ -1358,6 +1359,41 @@ function screenAdminDrawR1(){
   <button class="btn btn-gold" id="confirmDrawR1Btn" ${ready?'':'disabled'}>توليد جدول الدوري كاملاً بهذه المواجهات</button>`;
 }
 
+// lets the founder fix the matchups of ANY league round (including round 1) after the fact —
+// prefilled with that round's current pairs so only the wrong ones need to be removed/redone.
+function screenAdminRearrangeRound(){
+  const r = UI._rearrangeRound;
+  const round = STATE.league.rounds[r-1] || [];
+  if(!UI._draftPairs || !UI._draftInit){
+    UI._draftPairs = round.map(m=>[m.teamA, m.teamB]);
+    UI._draftPending = null;
+    UI._draftInit = true;
+  }
+  const pairedIds = new Set(UI._draftPairs.flat());
+  const teamBtns = STATE.teams.map(t=>{
+    const isPaired = pairedIds.has(t.id);
+    const isPending = UI._draftPending===t.id;
+    return `<button class="btn btn-sm draw-team-btn ${isPending?'btn-gold':'btn-ghost'}" data-team="${t.id}" ${isPaired?'disabled':''} style="margin:3px;width:auto">${t.name}</button>`;
+  }).join('');
+  const pairsHtml = UI._draftPairs.map(([a,b],i)=>`
+    <div class="match-row" style="cursor:default">
+      <div class="teams">${teamName(a)}<span class="vs">×</span>${teamName(b)}</div>
+      <button class="btn-ghost btn-sm remove-pair-btn" data-i="${i}" style="width:auto;padding:5px 10px;border:1px solid var(--line);border-radius:8px;color:var(--mute);font-family:Cairo;cursor:pointer;background:transparent">حذف</button>
+    </div>`).join('');
+  const remaining = STATE.teams.length - pairedIds.size;
+  const ready = UI._draftPairs.length===16;
+  const hasProgress = round.some(m=> m.status!=='pending' || m.questions.some(q=>q.text));
+  return `<div class="back" data-go="admin-round">→ رجوع</div>
+  <div class="card">
+    <h2>إعادة ترتيب الجولة ${r}</h2>
+    <div class="sub">هذه القائمة معبّأة بمواجهات الجولة الحالية. احذف أي مواجهة خاطئة بالضغط على "حذف"، ثم اضغط على مشارك ثم على خصمه الصحيح لتكوين المواجهة من جديد. تبقّى ${remaining} مشارك بدون مواجهة.</div>
+    ${hasProgress ? `<div class="pill pill-half mb8">تنبيه: هذه الجولة فيها أسئلة أو نتائج مسجّلة — تأكيد الترتيب الجديد سيمسحها ويعيد الجولة لبدايتها.</div>` : ''}
+    <div>${teamBtns}</div>
+  </div>
+  ${UI._draftPairs.length? `<div class="card"><h2>المواجهات (${UI._draftPairs.length}/16)</h2>${pairsHtml}</div>` : ''}
+  <button class="btn btn-gold" id="confirmRearrangeBtn" ${ready?'':'disabled'}>تأكيد الترتيب الجديد لهذه الجولة</button>`;
+}
+
 function roundStatusChip(round){
   const done = round.filter(m=>m.status==='finished').length;
   return `<span class="pill ${done===round.length?'pill-ready':'pill-half'}">${done}/${round.length} منتهية</span>`;
@@ -1406,6 +1442,7 @@ function screenAdminRound(){
     ${roundDeadlineBanner(r)}
     <div class="sub">اضغط على أي مباراة لكتابة الأسئلة أو تصحيح الإجابات</div>
     ${rows}
+    <button class="btn btn-ghost mt14" data-rearrange-round="${r}">🔀 إعادة ترتيب هذه الجولة (تصحيح المواجهات)</button>
     ${!started ? `<button class="btn btn-ghost mt14" id="startRoundBtn" data-round="${r}">تفعيل عدّاد 24 ساعة لهذه الجولة</button>` : ''}
     ${isLastRound && !allLeagueFinished ? `<div class="tiny mt14">لا يمكن إغلاق الدوري والذهاب للملحق حتى تنتهي كل الجولات الثماني، وليس فقط هذه الجولة.</div>` : ''}
     ${allLeagueFinished ? `<button class="btn btn-gold mt14" id="finishLeagueBtn">إنهاء الدوري والانتقال للملحق (9–24)</button>` : ''}
@@ -1679,6 +1716,30 @@ function bindEvents(){
       const pairs = UI._draftPairs.slice();
       await mutate(s=>{ STATE=s; generateLeague(pairs); });
       UI._draftPairs=[]; UI._draftPending=null;
+      UI.screen='admin-round'; render();
+    });
+  };
+
+  document.querySelectorAll('[data-rearrange-round]').forEach(b=>{
+    b.onclick = ()=>{
+      UI._rearrangeRound = parseInt(b.getAttribute('data-rearrange-round'));
+      UI._draftPairs = null; UI._draftPending = null; UI._draftInit = false; // force fresh prefill from that round's current pairs
+      UI.screen = 'admin-rearrange-round';
+      render();
+    };
+  });
+  const confirmRearrangeBtn = document.getElementById('confirmRearrangeBtn');
+  if(confirmRearrangeBtn) confirmRearrangeBtn.onclick = ()=>{
+    if(!UI._draftPairs || UI._draftPairs.length!==16) return;
+    showConfirm('سيتم استبدال مباريات هذه الجولة بالمواجهات الجديدة، وستُمسح أي أسئلة أو نتائج مسجّلة لها. متابعة؟', async ()=>{
+      const r = UI._rearrangeRound;
+      const pairs = UI._draftPairs.slice();
+      await mutate(s=>{
+        STATE = s;
+        STATE.league.rounds[r-1] = pairs.map(([a,b])=> newMatch('league', a, b, r));
+        STATE.league.roundStarted[r] = null; // restart the 24h window fresh for this round
+      });
+      UI._draftPairs=[]; UI._draftPending=null; UI._draftInit=false; UI._rearrangeRound=null;
       UI.screen='admin-round'; render();
     });
   };
