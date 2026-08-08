@@ -296,11 +296,14 @@ h2 .ico{width:24px;height:24px;font-size:13px;margin-inline-start:8px}
     async get(key, shared){
       if(!shared){
         const v = localStorage.getItem('ps_local_'+key);
-        if(v===null) throw new Error('not found: '+key);
+        if(v===null){ const err = new Error('not found: '+key); err.notFound = true; throw err; }
         return {key, value:v, shared:false};
       }
+      // Let a genuine Firestore/network failure (offline, permission, quota, etc.) throw
+      // as-is, UNCAUGHT here — that error has no .notFound flag, so callers can tell it
+      // apart from "this document has simply never been created yet".
       const snap = await db.collection('paris_cos').doc(key).get();
-      if(!snap.exists) throw new Error('not found: '+key);
+      if(!snap.exists){ const err = new Error('not found: '+key); err.notFound = true; throw err; }
       return {key, value: snap.data().value, shared:true};
     },
     async set(key, value, shared){
@@ -398,9 +401,10 @@ let IS_MUTATING = false;
 // AND when the read fails for a transient reason (network blip, offline, permission
 // hiccup). Those two cases must never be treated the same way — collapsing them into
 // "just use defaultState()" is what previously caused a live tournament to be silently
-// replaced by a blank one. FIRST_LOAD_OK tracks whether we've ever successfully
-// confirmed real tournament data exists (or genuinely doesn't) in this session, so we
-// can tell "brand new tournament" apart from "read failed, don't touch anything".
+// replaced by a blank one. We now tell them apart via err.notFound (set only for a
+// confirmed-missing document — see the window.storage.get() wrapper above). Only a
+// confirmed-missing doc is safe to treat as "brand new tournament, ok to save a blank
+// one". Any other error must NEVER be treated as safe to write over.
 let FIRST_LOAD_OK = false;
 
 async function loadState(){
@@ -409,15 +413,22 @@ async function loadState(){
     STATE = r && r.value ? JSON.parse(r.value) : defaultState();
     FIRST_LOAD_OK = true;
   }catch(e){
-    // Could mean "no tournament doc yet" (fine, start fresh) or "read failed"
-    // (network/permissions — NOT fine, do not fabricate a blank tournament).
-    // We can't always tell these apart from the thrown error alone, so we only ever
-    // fall back to defaultState() here on the very first boot, and we keep retrying
-    // in the background rather than trusting the blank state as truth.
-    console.error('initial load failed', e);
-    STATE = defaultState();
-    FIRST_LOAD_OK = false;
-    showAlert('تعذر الاتصال بقاعدة البيانات. تأكد من اتصال النت وأعد فتح الصفحة قبل إجراء أي تعديل، حتى لا تفقد بيانات البطولة.');
+    if(e && e.notFound){
+      // confirmed: no tournament document exists yet — this really is a brand new
+      // tournament, so starting blank (and later being allowed to save it) is correct.
+      STATE = defaultState();
+      FIRST_LOAD_OK = true;
+    } else {
+      // read genuinely failed (network/permission/quota/etc) — we have NO idea whether
+      // real tournament data exists in Firestore right now. Do not fabricate a blank
+      // state as if it were confirmed; loadState() still needs *some* STATE to render
+      // the screen, so we use defaultState() only to avoid a crash, but FIRST_LOAD_OK
+      // stays false so mutate() below refuses to ever save on top of it.
+      console.error('initial load failed', e);
+      STATE = defaultState();
+      FIRST_LOAD_OK = false;
+      showAlert('تعذر الاتصال بقاعدة البيانات. تأكد من اتصال النت وأعد فتح الصفحة قبل إجراء أي تعديل، حتى لا تفقد بيانات البطولة.');
+    }
   }
   ensureForum(STATE);
   ensureQuestionBank(STATE);
@@ -459,7 +470,15 @@ async function saveState(){
 // it against whatever STATE happens to be in memory (which could be a stale/blank default).
 // This is the fix for the bug that wiped the tournament: a transient read failure used to
 // silently fall through to fn(STATE) running on a blank state, and the blank result got
-// saved right over the real data. Now a failed read just cancels this one action safely.
+// saved right over the real data.
+//
+// NOTE: this abort must fire on ANY unconfirmed read failure — it must NOT depend on whether
+// the page's very first load happened to succeed earlier in the session. The previous version
+// only aborted "if FIRST_LOAD_OK" was true, which meant that the one case that actually
+// mattered — the first load having already failed, so STATE was already a fabricated blank —
+// was exactly the case where this guard did nothing, and the blank state got saved for real.
+// A pre-read that comes back err.notFound (confirmed no document exists) is the one and only
+// safe case to proceed on with a fresh/blank state; every other failure aborts, always.
 function mutate(fn){
   const run = SAVE_QUEUE.then(async ()=>{
     IS_MUTATING = true;
@@ -467,13 +486,17 @@ function mutate(fn){
       let readOk = false;
       try{
         const r = await window.storage.get('tournament', true);
-        if(r && r.value){ STATE = JSON.parse(r.value); readOk = true; }
+        if(r && r.value){ STATE = JSON.parse(r.value); }
+        readOk = true;
       }catch(e){
-        console.error('mutate: pre-read failed, aborting to avoid data loss', e);
+        if(e && e.notFound){
+          // confirmed: genuinely no tournament document yet — safe to proceed and create one
+          readOk = true;
+        } else {
+          console.error('mutate: pre-read failed, aborting to avoid data loss', e);
+        }
       }
-      if(!readOk && FIRST_LOAD_OK){
-        // We previously had real data this session but couldn't confirm it's still there —
-        // refuse to write anything until we can verify, rather than risk overwriting it.
+      if(!readOk){
         showAlert('تعذر التحقق من آخر نسخة محفوظة قبل الحفظ. لم يتم إجراء أي تعديل — تأكد من اتصال النت وحاول مرة أخرى.');
         return;
       }
@@ -493,14 +516,36 @@ function mutate(fn){
 }
 
 // Manual recovery helper: restores 'tournament' from the last automatic backup.
-// Run from the browser console: restoreFromBackup()
+// Usable both from the founder panel (button) and from the browser console: restoreFromBackup()
 async function restoreFromBackup(){
   try{
     const b = await window.storage.get('tournament_backup', true);
-    if(!b || !b.value){ console.log('لا توجد نسخة احتياطية محفوظة.'); return; }
+    if(!b || !b.value){ console.log('لا توجد نسخة احتياطية محفوظة.'); return false; }
     await window.storage.set('tournament', b.value, true);
-    console.log('تم الاسترجاع من النسخة الاحتياطية. أعد تحميل الصفحة.');
-  }catch(e){ console.error('restore failed', e); }
+    STATE = JSON.parse(b.value);
+    console.log('تم الاسترجاع من النسخة الاحتياطية.');
+    return true;
+  }catch(e){ console.error('restore failed', e); return false; }
+}
+
+// Restores the tournament wholesale from a manually-downloaded backup JSON file.
+// Unlike mutate(), this deliberately does NOT merge with whatever is currently in
+// Firestore — the whole point is to replace it, so it goes through the same save
+// queue (to stay serialized with any in-flight save) but skips the pre-read merge.
+async function restoreFromUploadedState(parsedState){
+  const run = SAVE_QUEUE.then(async ()=>{
+    IS_MUTATING = true;
+    try{
+      STATE = parsedState;
+      ensureForum(STATE);
+      ensureQuestionBank(STATE);
+      await Promise.all([backupState(), saveState()]);
+    } finally {
+      IS_MUTATING = false;
+    }
+  });
+  SAVE_QUEUE = run.catch(()=>{});
+  return run;
 }
 async function setMyTeam(id){
   MY_TEAM = id;
@@ -639,6 +684,7 @@ function matchRowLabel(m, prog){
   prog = prog || matchProgressLabel(m);
   if(m.status==='finished'){
     if(m.winner==='draw') return 'تعادل — منتهية';
+    if(m.winner==='double_loss') return 'خسارة مزدوجة — لا نقاط لأي طرف';
     const forfeitTag = (m.forfeit==='a'||m.forfeit==='b') ? ' (بالتغيّب بعد 24 ساعة)' : '';
     return 'منتهية: '+teamName(m.winner)+' فاز'+forfeitTag;
   }
@@ -681,6 +727,7 @@ function computeStandings(){
       if(m.winner==='draw'){ tbl[m.teamA].pts+=1; tbl[m.teamB].pts+=1; tbl[m.teamA].d++; tbl[m.teamB].d++; }
       else if(m.winner===m.teamA){ tbl[m.teamA].pts+=3; tbl[m.teamA].w++; tbl[m.teamB].l++; }
       else if(m.winner===m.teamB){ tbl[m.teamB].pts+=3; tbl[m.teamB].w++; tbl[m.teamA].l++; }
+      else if(m.winner==='double_loss'){ tbl[m.teamA].l++; tbl[m.teamB].l++; } // neither played — 0 points each, both counted as a loss
     });
   });
   return Object.values(tbl).sort((x,y)=>{
@@ -1145,12 +1192,13 @@ function screenStandings(){
     const zoneCls = i<8 ? 'q-direct' : (i<24 ? 'q-playoff' : 'q-out');
     const mineCls = (MY_TEAM && t.id===MY_TEAM) ? 'mine' : '';
     return `<div class="standrow ${zoneCls} ${mineCls}"><span class="rank">${i+1}</span><span class="name">${t.name}</span>
-      <span class="tiny">${t.p} لعب</span><span class="pts">${t.pts} نقطة</span></div>`;
+      <span class="tiny">${t.p}لعب</span><span class="tiny">${t.w}ف</span><span class="tiny">${t.d}ت</span><span class="tiny">${t.l}خ</span><span class="pts">${t.pts}ن</span></div>`;
   }).join('');
   return `<div class="back" data-go="home">→ رجوع</div>
   <div class="card">
     <h2>ترتيب الدوري</h2>
     <div class="sub">🟩 1–8 تأهل مباشر · 🟦 9–24 ملحق · 🟥 25–32 خروج${MY_TEAM? ' · 🟡 الإطار الذهبي = مركزك':''}</div>
+    <div class="tiny mb8">ف = فوز · ت = تعادل · خ = خسارة · ن = نقاط</div>
     ${rows}
   </div>`;
 }
@@ -1380,6 +1428,14 @@ function screenAdminHome(){
     <button class="btn btn-ghost" data-go="bracket">عرض المخطط</button>
   </div>
   <div class="card">
+    <h2>🛟 النسخ الاحتياطي</h2>
+    <div class="sub">قبل أي تعديل كبير، نزّل نسخة احتياطية على جهازك — تبقى عندك حتى لو صار أي عطل بقاعدة البيانات.</div>
+    <button class="btn btn-ghost" id="downloadBackupBtn">📥 تنزيل نسخة احتياطية الآن (ملف على جهازك)</button>
+    <button class="btn btn-ghost mt14" id="restoreBackupBtn" style="color:var(--red-2)">⏮️ استرجاع من آخر نسخة تلقائية بقاعدة البيانات</button>
+    <input type="file" id="restoreFileInput" accept="application/json" style="display:none">
+    <button class="btn btn-ghost mt14" id="restoreFromFileBtn" style="color:var(--red-2)">📤 استرجاع من ملف نسخة احتياطية محمّل</button>
+  </div>
+  <div class="card">
     <h2>إعدادات</h2>
     <label>تغيير الرمز السري</label>
     <input type="text" id="newCode" placeholder="${STATE.adminCode}">
@@ -1561,22 +1617,32 @@ function formatRemaining(ms){
   const m = Math.floor((ms%3600000)/60000);
   return `${h} ساعة و ${m} دقيقة متبقية`;
 }
-function deadlineBannerFromStart(startedAt){
+// allDone: pass true once every match in this round/stage is finished — the 24h countdown
+// becomes meaningless at that point (nothing left to wait on), so we show a clear "اكتملت"
+// badge instead of a ticking/expired timer, which used to just sit there looking alarming
+// or confusing after the round was already fully over.
+function deadlineBannerFromStart(startedAt, allDone){
+  if(allDone) return `<div class="pill pill-ready mb8">✅ اكتملت هذه الجولة — توقف العدّاد</div>`;
   if(!startedAt) return `<div class="pill pill-wait mb8">لم يبدأ عدّاد الـ24 ساعة لهذا الدور بعد</div>`;
   const remaining = (startedAt + 24*3600000) - Date.now();
   return `<div class="pill ${remaining<=0?'pill-half':'pill-ready'} mb8">⏱ ${formatRemaining(remaining)}</div>`;
 }
 function roundDeadlineBanner(roundNum){
-  return deadlineBannerFromStart(STATE.league.roundStarted[roundNum]);
+  const round = STATE.league.rounds[roundNum-1] || [];
+  const allDone = round.length>0 && round.every(m=>m.status==='finished');
+  return deadlineBannerFromStart(STATE.league.roundStarted[roundNum], allDone);
 }
 function stageDeadlineBanner(m){
-  return deadlineBannerFromStart(matchStartedAt(m));
+  return deadlineBannerFromStart(matchStartedAt(m), false); // mid-question view — never show "completed", the player is actively answering
 }
 
 function screenAdminRound(){
   const r = STATE.league.currentRound;
   const rounds = STATE.league.rounds;
-  const tabs = rounds.map((rr,i)=>`<button class="${i+1===r?'active':''}" data-round="${i+1}">جولة ${i+1}</button>`).join('');
+  const tabs = rounds.map((rr,i)=>{
+    const roundDone = rr.length>0 && rr.every(m=>m.status==='finished');
+    return `<button class="${i+1===r?'active':''}" data-round="${i+1}">جولة ${i+1}${roundDone?' ✅':''}</button>`;
+  }).join('');
   const round = rounds[r-1] || [];
   const allReady = round.every(m=> m.questions.some(q=>q.text));
   const isLastRound = r===8;
@@ -1587,6 +1653,7 @@ function screenAdminRound(){
     const cls = m.status==='finished' ? 'pill-ready' : (m.status==='expired' ? 'pill-half' : prog.cls);
     return `<div class="match-row" data-match="${m.id}">
       <div class="teams">${teamName(m.teamA)}<span class="vs">×</span>${teamName(m.teamB)}</div>
+      <button class="manual-result-btn" data-manual-result="${m.id}" style="width:auto;padding:5px 10px;border:1px solid var(--line);border-radius:8px;color:var(--gold);font-family:Cairo;font-size:12px;cursor:pointer;background:transparent;flex-shrink:0">⚖️ نتيجة يدوية</button>
       <span class="pill ${cls}">${label}</span>
     </div>`;
   }).join('');
@@ -1841,7 +1908,7 @@ function screenAdminGrade(){
   const isExpired = m.status==='expired';
   const forfeitNote = (m.forfeit==='a'||m.forfeit==='b') ? ' — حسمها النظام تلقائياً بالتغيّب بعد انتهاء مهلة الـ24 ساعة' : '';
   const finishedBanner = isFinished
-    ? `<div class="pill pill-ready mb8">منتهية — الفائز الحالي: ${m.winner==='draw' ? 'تعادل' : teamName(m.winner)}${forfeitNote}</div>
+    ? `<div class="pill pill-ready mb8">منتهية — الفائز الحالي: ${m.winner==='draw' ? 'تعادل' : (m.winner==='double_loss' ? 'خسارة مزدوجة (لا فائز، 0 نقطة للطرفين)' : teamName(m.winner))}${forfeitNote}</div>
        <div class="tiny mb8">هذه المباراة منتهية بالفعل. يمكنك تصحيح النتيجة أدناه في حال حصل خطأ في التصحيح أو غش من أحد الطرفين.
        تنبيه: إذا كانت هذه المباراة استُخدمت لتوليد قرعة الدور التالي، فتغيير الفائز هنا لن يحدّث تلك المباريات تلقائياً — راجعها وعدّلها يدوياً أيضاً إذا لزم الأمر.</div>`
     : (isExpired
@@ -1864,6 +1931,7 @@ function screenAdminGrade(){
     </div>
     ${isLeague ? `<button class="btn btn-ghost mt14" id="drawBtn">تعادل (نقطة لكل فريق)</button>`
                : `<button class="btn btn-gold mt14" id="drawBtn">تعادل — أضف 5 أسئلة وقت إضافي</button>`}
+    ${isLeague ? `<button class="btn btn-ghost mt14" id="doubleLossBtn" style="color:var(--red-2)">⚖️ لم يلعب أي منهما (خسارة لكليهما، 0 نقطة للطرفين)</button>` : ''}
   </div>`;
 }
 
@@ -1878,6 +1946,7 @@ function screenAdminKnockout(){
     const cls = m.status==='finished' ? 'pill-ready' : (m.status==='expired' ? 'pill-half' : prog.cls);
     return `<div class="match-row" data-match="${m.id}">
       <div class="teams">${teamName(m.teamA)}<span class="vs">×</span>${teamName(m.teamB)}</div>
+      <button class="manual-result-btn" data-manual-result="${m.id}" style="width:auto;padding:5px 10px;border:1px solid var(--line);border-radius:8px;color:var(--gold);font-family:Cairo;font-size:12px;cursor:pointer;background:transparent;flex-shrink:0">⚖️ نتيجة يدوية</button>
       <span class="pill ${cls}">${label}</span>
     </div>`;
   }).join('');
@@ -1893,7 +1962,7 @@ function screenAdminKnockout(){
   return `<div class="back" data-go="admin-home">→ رجوع</div>
   <div class="card">
     <h2>${PHASE_LABEL[stage]}</h2>
-    ${deadlineBannerFromStart(startedAt)}
+    ${deadlineBannerFromStart(startedAt, canAdvance)}
     <div class="sub">اضغط على مباراة لكتابة الأسئلة أو التصحيح. لا يستطيع المشاركون الإجابة حتى تُفعّل عدّاد الـ24 ساعة لهذا الدور.</div>
     ${rows || '<div class="empty">لا توجد مباريات هنا بعد</div>'}
     ${!startedAt ? `<button class="btn btn-ghost mt14" id="startStageBtn" data-stage="${stage}">تفعيل عدّاد 24 ساعة لهذا الدور</button>` : ''}
@@ -2043,6 +2112,50 @@ function bindEvents(){
       UI._draftPairs=[]; UI._draftPending=null; UI._draftInit=false; UI._rearrangeRound=null;
       UI.screen='admin-round'; render();
     });
+  };
+
+  const downloadBackupBtn = document.getElementById('downloadBackupBtn');
+  if(downloadBackupBtn) downloadBackupBtn.onclick = ()=>{
+    try{
+      const blob = new Blob([JSON.stringify(STATE, null, 2)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const ts = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+      a.href = url; a.download = `paris-cos-backup-${ts}.json`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }catch(e){ showAlert('تعذر إنشاء ملف النسخة الاحتياطية.'); }
+  };
+
+  const restoreBackupBtn = document.getElementById('restoreBackupBtn');
+  if(restoreBackupBtn) restoreBackupBtn.onclick = ()=>{
+    showConfirm('سيتم استبدال البطولة الحالية بآخر نسخة احتياطية محفوظة تلقائياً بقاعدة البيانات. هذا الإجراء لا يمكن التراجع عنه. متابعة؟', async ()=>{
+      const ok = await restoreFromBackup();
+      if(ok){ showAlert('تم الاسترجاع بنجاح. سيتم إعادة تحميل الصفحة الآن.'); setTimeout(()=>location.reload(), 1200); }
+      else showAlert('تعذر الاسترجاع — لا توجد نسخة احتياطية محفوظة أو حصل خطأ اتصال.');
+    });
+  };
+
+  const restoreFromFileBtn = document.getElementById('restoreFromFileBtn');
+  const restoreFileInput = document.getElementById('restoreFileInput');
+  if(restoreFromFileBtn && restoreFileInput) restoreFromFileBtn.onclick = ()=> restoreFileInput.click();
+  if(restoreFileInput) restoreFileInput.onchange = ()=>{
+    const file = restoreFileInput.files && restoreFileInput.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      let parsed;
+      try{ parsed = JSON.parse(reader.result); }
+      catch(e){ showAlert('هذا الملف ليس نسخة احتياطية صالحة (JSON غير سليم).'); restoreFileInput.value=''; return; }
+      if(!parsed || !Array.isArray(parsed.teams)){ showAlert('هذا الملف لا يبدو نسخة احتياطية لهذه البطولة.'); restoreFileInput.value=''; return; }
+      showConfirm('سيتم استبدال البطولة الحالية بالكامل بمحتوى هذا الملف. هذا الإجراء لا يمكن التراجع عنه. متابعة؟', async ()=>{
+        await restoreFromUploadedState(parsed);
+        showAlert('تم الاسترجاع من الملف بنجاح. سيتم إعادة تحميل الصفحة الآن.');
+        setTimeout(()=>location.reload(), 1200);
+      });
+      restoreFileInput.value='';
+    };
+    reader.readAsText(file);
   };
 
   const saveCodeBtn = document.getElementById('saveCodeBtn');
@@ -2197,6 +2310,18 @@ function bindEvents(){
     });
   };
 
+  // manual-result button on a match row: jump straight to the win/draw decision screen,
+  // regardless of whether questions exist yet or anyone has answered. stopPropagation so
+  // this doesn't also trigger the row's own click (which would route by progress instead).
+  document.querySelectorAll('.manual-result-btn').forEach(b=>{
+    b.onclick = (e)=>{
+      e.stopPropagation();
+      UI._openMatch = b.getAttribute('data-manual-result');
+      UI.screen = 'admin-grade';
+      render();
+    };
+  });
+
   // match rows -> open match (questions or grading)
   document.querySelectorAll('[data-match]').forEach(row=>{
     row.onclick = ()=>{
@@ -2260,6 +2385,10 @@ function bindEvents(){
   if(winB) winB.onclick = ()=> finalizeMatch('teamB');
   const drawBtn = document.getElementById('drawBtn');
   if(drawBtn) drawBtn.onclick = ()=> finalizeDraw();
+  const doubleLossBtn = document.getElementById('doubleLossBtn');
+  if(doubleLossBtn) doubleLossBtn.onclick = ()=>{
+    showConfirm('سيتم اعتبار الفريقين خاسرين ولن يحصل أي منهما على أي نقطة لهذه المباراة. متابعة؟', ()=> finalizeDoubleLoss());
+  };
 
   const startRoundBtn = document.getElementById('startRoundBtn');
   if(startRoundBtn) startRoundBtn.onclick = async ()=>{
@@ -2365,6 +2494,15 @@ function bindEvents(){
     });
     render();
   };
+}
+
+async function finalizeDoubleLoss(){
+  await mutate(s=>{
+    STATE=s;
+    const m = findMatchById(UI._openMatch);
+    m.winner='double_loss'; m.status='finished';
+  });
+  UI.screen='admin-round'; render();
 }
 
 async function finalizeMatch(sideKeyName){
