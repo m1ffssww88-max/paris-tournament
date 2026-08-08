@@ -420,6 +420,7 @@ async function loadState(){
     showAlert('تعذر الاتصال بقاعدة البيانات. تأكد من اتصال النت وأعد فتح الصفحة قبل إجراء أي تعديل، حتى لا تفقد بيانات البطولة.');
   }
   ensureForum(STATE);
+  ensureQuestionBank(STATE);
   try{
     const m = await window.storage.get('my_team', false);
     MY_TEAM = m && m.value ? JSON.parse(m.value) : null;
@@ -477,9 +478,12 @@ function mutate(fn){
         return;
       }
       ensureForum(STATE);
+      ensureQuestionBank(STATE);
       fn(STATE);
-      await backupState(); // snapshot before overwriting, so this write is recoverable if it's wrong
-      await saveState();
+      // backup + real save both write the same freshly-mutated STATE, so there's no ordering
+      // dependency between them — running them in parallel (instead of one after the other)
+      // roughly halves the time a save takes, with no change in what gets saved or recovered.
+      await Promise.all([backupState(), saveState()]);
     } finally {
       IS_MUTATING = false;
     }
@@ -537,7 +541,8 @@ function defaultState(){
     qf:{ matches:[], startedAt:null },
     sf:{ matches:[], startedAt:null },
     final:{ match:null, startedAt:null },
-    champion:null
+    champion:null,
+    questionBank:{ easy:[], medium:[], hard:[], impossible:[] }
   };
 }
 
@@ -799,6 +804,16 @@ function ensureForum(s){
   (s.teams||[]).forEach(t=>{ if(t.muted===undefined) t.muted=false; });
 }
 
+// migration helper for tournaments saved before the question bank existed —
+// mirrors ensureForum's pattern so old saved states get the field without wiping anything else.
+function ensureQuestionBank(s){
+  if(!s) return;
+  if(!s.questionBank) s.questionBank = { easy:[], medium:[], hard:[], impossible:[] };
+  ['easy','medium','hard','impossible'].forEach(k=>{
+    if(!Array.isArray(s.questionBank[k])) s.questionBank[k] = [];
+  });
+}
+
 async function loadForumLastRead(){
   try{
     const r = await window.storage.get('forum_last_read', false);
@@ -980,6 +995,7 @@ async function bodyFor(screen){
     case 'admin-login': return screenAdminLogin();
     case 'admin-home': return screenAdminHome();
     case 'admin-teams': return screenAdminTeams();
+    case 'admin-bank': return screenAdminBank();
     case 'admin-draw-r1': return screenAdminDrawR1();
     case 'admin-round': return screenAdminRound();
     case 'admin-rearrange-round': return screenAdminRearrangeRound();
@@ -1358,6 +1374,7 @@ function screenAdminHome(){
       : `<button class="btn btn-primary" data-go="admin-teams">إدارة أسماء المشاركين وأكوادهم</button>`}
     ${STATE.stage==='league' ? `<button class="btn btn-blue" data-go="admin-round">إدارة جولات الدوري</button>` : ''}
     ${['playoff','r16','qf','sf','final'].includes(STATE.stage) ? `<button class="btn btn-blue" data-go="admin-knockout">إدارة الدور الإقصائي الحالي</button>` : ''}
+    <button class="btn btn-blue" data-go="admin-bank">🗂 بنك الأسئلة</button>
     <button class="btn btn-gold mt14" data-go="admin-forum">إدارة منتدى الهياط 🔥${myUnreadMentions().length? '<span class="badge-dot"></span>':''}</button>
     <button class="btn btn-ghost mt14" data-go="standings">عرض الترتيب</button>
     <button class="btn btn-ghost" data-go="bracket">عرض المخطط</button>
@@ -1371,6 +1388,87 @@ function screenAdminHome(){
     <input type="text" id="newFounderHandle" placeholder="${STATE.founderHandle}">
     <button class="btn btn-ghost btn-sm" id="saveFounderHandleBtn">حفظ الاسم</button>
   </div>`;
+}
+
+const BANK_CAP = 100;
+
+function screenAdminBank(){
+  if(!UI._bankTab) UI._bankTab = 'easy';
+  const tab = UI._bankTab;
+  const tabs = Object.keys(DIFF_META).map(k=>
+    `<button class="${k===tab?'active':''}" data-bank-tab="${k}">${DIFF_META[k].label} (${STATE.questionBank[k].length}/${BANK_CAP})</button>`
+  ).join('');
+  const list = STATE.questionBank[tab].map((q,i)=>`
+    <div class="match-row" style="cursor:default;align-items:flex-start">
+      <div class="teams" style="font-weight:400;font-size:13px;flex:1">${q}</div>
+      <button class="btn-ghost btn-sm bank-del-btn" data-diff="${tab}" data-idx="${i}" style="width:auto;padding:5px 10px;border:1px solid var(--line);border-radius:8px;color:var(--red-2);font-family:Cairo;cursor:pointer;background:transparent;flex-shrink:0">حذف</button>
+    </div>`).join('') || '<div class="empty">لا توجد أسئلة بعد في هذا القسم</div>';
+  return `<div class="back" data-go="admin-home">→ رجوع</div>
+  <div class="card">
+    <h2>⚡ تعبئة تلقائية جاهزة</h2>
+    <div class="sub">100 سؤال جاهزة عن باريس سان جيرمان (30 سهل + 30 وسط + 30 صعب + 10 مستحيل)، مدمجة بالكود مباشرة. ضغطة وحدة تملأ البنك بدون نسخ أو لصق.</div>
+    <button class="btn btn-gold" id="bankSeedBtn">تعبئة البنك بالأسئلة الجاهزة (100 سؤال)</button>
+  </div>
+  <div class="card">
+    <h2>استيراد جماعي</h2>
+    <div class="sub">الصق النص كامل بنفس الصيغة (عناوين الأقسام + سؤال داخل كل بلوك كود ثلاثي). سيتم تصنيف كل سؤال لقسمه تلقائياً بحسب أقرب عنوان قبله، بدون الحاجة لاختيار تبويب معيّن.</div>
+    <textarea id="bankImportBox" placeholder="الصق النص هنا..." style="min-height:140px"></textarea>
+    <button class="btn btn-primary" id="bankImportBtn">استيراد وتصنيف تلقائي</button>
+  </div>
+  <div class="card">
+    <h2>إضافة يدوية لقسم: ${DIFF_META[tab].label}</h2>
+    <div class="sub">سؤال واحد في كل سطر — تُضاف مباشرة لهذا القسم فقط.</div>
+    <textarea id="bankManualBox" placeholder="سؤال في كل سطر..." style="min-height:90px"></textarea>
+    <button class="btn btn-ghost" id="bankManualAddBtn" data-diff="${tab}">إضافة لقسم ${DIFF_META[tab].label}</button>
+  </div>
+  <div class="topnav">${tabs}</div>
+  <div class="card">
+    <h2>أسئلة قسم ${DIFF_META[tab].label} <span class="tiny">(${STATE.questionBank[tab].length}/${BANK_CAP})</span></h2>
+    <div class="grow-list">${list}</div>
+  </div>`;
+}
+
+/* ---------------- auto-fill empty question slots from the bank ----------------
+   Only ever touches EMPTY slots (q.text===''). Any slot that already has text is left
+   completely alone, so a match the founder already wrote/answered questions for is
+   untouched — matching how the founder actually uses this (some matches manual, others
+   auto-filled). Picks are random WITH repetition allowed — the bank is a pool to draw
+   from, not a one-time-use deck, so every round (1 through the final) can always be
+   filled completely even with a small bank, and the same question can appear in more
+   than one match. */
+const AUTO_FILL_TARGET = { easy:3, medium:3, hard:3, impossible:1 };
+function autoFillRoundQuestions(round){
+  const report = { used:{easy:0,medium:0,hard:0,impossible:0}, shortage:{easy:0,medium:0,hard:0,impossible:0}, matchesTouched:0 };
+  round.forEach(m=>{
+    if(m.status==='finished' || m.status==='expired') return; // don't touch settled matches
+    const already = { easy:0, medium:0, hard:0, impossible:0 };
+    m.questions.forEach(q=>{ if(q.text && q.difficulty && already[q.difficulty]!==undefined) already[q.difficulty]++; });
+    // build the ordered list of difficulties still needed for this match
+    const needQueue = [];
+    Object.keys(AUTO_FILL_TARGET).forEach(diff=>{
+      const need = Math.max(0, AUTO_FILL_TARGET[diff] - already[diff]);
+      for(let i=0;i<need;i++) needQueue.push(diff);
+    });
+    let touchedThisMatch = false;
+    for(const q of m.questions){
+      if(q.text) continue; // already filled — never overwritten
+      const diff = needQueue.shift();
+      if(!diff) break; // no more needed for this match (shouldn't normally happen with 10 slots)
+      const bank = STATE.questionBank[diff];
+      if(!bank.length){ report.shortage[diff]++; continue; } // only happens if that category is entirely empty
+      const pickIdx = Math.floor(Math.random()*bank.length);
+      const text = bank[pickIdx]; // read-only pick — repetition across matches/rounds is fine and expected
+      q.text = text;
+      q.difficulty = diff;
+      report.used[diff]++;
+      touchedThisMatch = true;
+    }
+    if(touchedThisMatch){
+      if(m.questions.some(qq=>qq.text)) m.status='ready';
+    }
+    if(touchedThisMatch) report.matchesTouched++;
+  });
+  return report;
 }
 
 function screenAdminTeams(){
@@ -1501,6 +1599,7 @@ function screenAdminRound(){
     <div class="sub">اضغط على أي مباراة لكتابة الأسئلة أو تصحيح الإجابات</div>
     ${rows}
     <button class="btn btn-ghost mt14" data-rearrange-round="${r}">🔀 إعادة ترتيب هذه الجولة (تصحيح المواجهات)</button>
+    <button class="btn btn-gold mt14" id="autoFillRoundBtn" data-round="${r}">🎲 ملء تلقائي بالأسئلة الفارغة (3 سهل + 3 وسط + 3 صعب + 1 مستحيل)</button>
     ${!started ? `<button class="btn btn-ghost mt14" id="startRoundBtn" data-round="${r}">تفعيل عدّاد 24 ساعة لهذه الجولة</button>` : ''}
     ${isLastRound && !allLeagueFinished ? `<div class="tiny mt14">لا يمكن إغلاق الدوري والذهاب للملحق حتى تنتهي كل الجولات الثماني، وليس فقط هذه الجولة.</div>` : ''}
     ${allLeagueFinished ? `<button class="btn btn-gold mt14" id="finishLeagueBtn">إنهاء الدوري والانتقال للملحق (9–24)</button>` : ''}
@@ -1524,6 +1623,150 @@ function diffBadge(diff){
   const meta = DIFF_META[diff];
   if(!meta) return '';
   return `<span class="diff-badge ${meta.cls}">${meta.label}</span>`;
+}
+
+/* ---------------- question bank: import parsing ----------------
+   Understands the format the founder pastes: section headers containing
+   "سهل"/"متوسط"/"وسط"/"صعب"/"مستحيل" (with or without emoji/markdown around them),
+   followed by one question per ``` code block. Any line outside a code block is only
+   ever checked as a possible header — it never becomes a question on its own, so
+   stray notes/titles in a pasted doc are safely ignored rather than imported as junk. */
+const SEED_QUESTIONS = {
+  "easy": [
+    "من تُوج بالدوري الفرنسي موسم 2012/13؟",
+    "من كان مدرب باريس سان جيرمان في موسم 2013/14؟",
+    "من كان هداف باريس في موسم 2013/14؟",
+    "من انتقل إلى باريس سان جيرمان قادمًا من نابولي عام 2013؟",
+    "من سجل هدف باريس في نهائي كأس فرنسا 2015 أمام أوكسير؟",
+    "من كان مدرب باريس عند تحقيق الرباعية المحلية التاريخية في 2015؟",
+    "من سجل هدف باريس في نهائي كأس فرنسا 2016 أمام مارسيليا؟",
+    "من سجل هدف باريس في نهائي كأس فرنسا 2017 أمام أنجيه؟",
+    "من سجل هدف باريس الأول أمام برشلونة في الفوز 4-0 عام 2017؟",
+    "كم هدفًا سجل دي ماريا أمام برشلونة في مباراة 4-0؟",
+    "من سجل هدف باريس الثاني أمام برشلونة 4-0؟",
+    "من سجل هدف باريس الرابع أمام برشلونة 4-0؟",
+    "من انتقل إلى باريس من برشلونة في صيف 2017؟",
+    "من انتقل إلى باريس من موناكو في صيف 2017؟",
+    "من كان هداف باريس التاريخي قبل كافاني؟",
+    "من أصبح الهداف التاريخي لباريس في يناير 2018؟",
+    "من كان مدرب باريس في موسم 2018/19؟",
+    "من سجل هدف باريس في نهائي كأس فرنسا 2020 أمام سانت إيتيان؟",
+    "من واجه باريس في نهائي دوري أبطال أوروبا 2020؟",
+    "ما نتيجة نهائي دوري الأبطال 2020؟",
+    "من سجل هدف بايرن في النهائي؟",
+    "من كان حارس باريس في نهائي 2020؟",
+    "من أصبح قائد باريس بعد رحيل تياغو سيلفا؟",
+    "من انضم إلى باريس عام 2021 قادمًا من برشلونة؟",
+    "من سجل أول هدف لميسي مع باريس؟",
+    "ضد من سجل ميسي أول هدف له مع باريس؟",
+    "من كان مدرب باريس في موسم 2022/23؟",
+    "من أصبح الهداف التاريخي لباريس في مارس 2023؟",
+    "من كان مدرب باريس في موسم 2023/24؟",
+    "من فاز باريس عليه في نهائي دوري الأبطال 2025؟"
+  ],
+  "medium": [
+    "كم هدفًا سجل زلاتان في موسم 2013/14 مع باريس؟",
+    "كم هدفًا سجل زلاتان في موسم 2015/16؟",
+    "من صنع هدف كافاني في نهائي كأس فرنسا 2015؟",
+    "من كان قائد باريس في نهائي دوري الأبطال 2020؟",
+    "من كان صاحب تمريرة هدف كافاني ضد أرسنال في 2016 ضمن تعادل 2-2؟",
+    "من سجل هدف باريس في الفوز 1-0 على ريال مدريد عام 2022؟",
+    "من صنع هدف مبابي ضد ريال مدريد في 2022؟",
+    "من سجل هدفي باريس في الفوز 2-0 على بوروسيا دورتموند عام 2020؟",
+    "من سجل هدف باريس الأول أمام أتالانتا في ربع نهائي 2020؟",
+    "من سجل هدف الفوز على أتالانتا؟",
+    "من سجل هدف باريس الأول أمام لايبزيغ في نصف نهائي 2020؟",
+    "من سجل الهدف الثاني لباريس أمام لايبزيغ؟",
+    "من سجل الهدف الثالث في نصف نهائي 2020 أمام لايبزيغ؟",
+    "من كان خصم باريس في نصف نهائي دوري الأبطال 2021؟",
+    "من سجل هدف باريس في ذهاب نصف النهائي ضد مانشستر سيتي 2021؟",
+    "من سجل هدف باريس في إياب نصف النهائي 2021؟",
+    "من سجل هدف باريس الأول في الفوز 4-1 على برشلونة عام 2021؟",
+    "كم هدفًا سجل مبابي ضد برشلونة في مباراة 4-1 عام 2021؟",
+    "من سجل الهدف الآخر لباريس في تلك المباراة؟",
+    "من كان حارس باريس في مباراة برشلونة 1-4 عام 2021؟",
+    "كم مباراة خاض ميسي مع باريس؟",
+    "كم هدفًا سجل ميسي مع باريس؟",
+    "كم تمريرة حاسمة صنع ميسي مع باريس؟",
+    "من كان شريك ميسي الهجومي الأبرز في باريس خلال موسم 2021/22؟",
+    "من سجل هدف باريس الأول في نهائي كأس فرنسا 2024 أمام ليون؟",
+    "من سجل الهدف الثاني لباريس في نهائي كأس فرنسا 2024؟",
+    "من سجل هدف باريس في إياب نصف نهائي دوري الأبطال 2024 ضد دورتموند؟",
+    "من كان هداف باريس في دوري الأبطال موسم 2024/25؟",
+    "من سجل هدف باريس الأول في نهائي دوري الأبطال 2025؟",
+    "كم انتهى نهائي دوري الأبطال 2025؟"
+  ],
+  "hard": [
+    "من صنع هدف دي ماريا الأول ضد برشلونة في مباراة 4-0 عام 2017؟",
+    "في أي دقيقة سجل دي ماريا هدف باريس الأول ضد برشلونة 2017؟",
+    "من صنع هدف دراكسلر ضد برشلونة 2017؟",
+    "من صنع هدف كافاني الرابع ضد برشلونة 2017؟",
+    "من سجل هدف باريس في خسارة الإياب 6-1 أمام برشلونة عام 2017؟",
+    "من صنع هدف كافاني في مباراة 6-1؟",
+    "من سجل هدف باريس الأول في مباراة 3-2 أمام برشلونة عام 2013؟",
+    "من سجل هدف باريس الثاني في نفس المباراة؟",
+    "من كان مدرب باريس في مباراة برشلونة 3-2 عام 2014؟",
+    "من سجل هدف باريس الثاني ضد تشيلسي في الفوز 2-1 عام 2016؟",
+    "من صنع هدف كافاني ضد تشيلسي 2016؟",
+    "من سجل هدف باريس الأول ضد تشيلسي في تلك المباراة؟",
+    "من سجل هدف باريس الوحيد في نهائي كأس فرنسا 2015؟",
+    "من كان صاحب تمريرة الهدف في نهائي كأس فرنسا 2015؟",
+    "من كان صاحب الرقم القياسي السابق لهداف باريس قبل كافاني؟",
+    "كم هدفًا كان رصيد كافاني عندما تجاوز إبراهيموفيتش؟",
+    "من كان أول لاعب في تاريخ باريس يسجل 50 هدفًا في موسم واحد؟",
+    "في أي موسم سجل زلاتان 50 هدفًا؟",
+    "من كان أكثر لاعب مشاركة مع باريس في دوري الأبطال حسب سجل UEFA حتى نهاية 2025/26؟",
+    "كم مباراة دوري أبطال خاضها ماركينيوس مع باريس وفق سجل UEFA؟",
+    "من يأتي خلف ماركينيوس في عدد مشاركات باريس بدوري الأبطال؟",
+    "كم مشاركة لفيراتي في دوري الأبطال مع باريس وفق سجل UEFA؟",
+    "من ثالث هداف لباريس في دوري الأبطال وفق سجل UEFA؟",
+    "من كان هداف باريس في دوري الأبطال 2019/20؟",
+    "كم مباراة لعب باريس في دوري الأبطال 2019/20؟",
+    "كم مباراة فاز بها باريس في دوري الأبطال 2019/20؟",
+    "كم تعادل باريس في دوري الأبطال 2019/20؟",
+    "كم خسارة تعرض لها باريس في دوري الأبطال 2019/20؟",
+    "من اللاعب الوحيد الذي سجل لباريس في نهائي دوري الأبطال 2025؟",
+    "من كان مدرب باريس عندما وصل لأول نهائي دوري أبطال في تاريخه؟"
+  ],
+  "impossible": [
+    "من اللاعب الذي ارتدى شارة قيادة باريس في مباراته رقم 221 كقائد، محققًا الرقم القياسي وقتها؟",
+    "من اللاعب الذي أصبح الهداف التاريخي لباريس برصيد 201 هدف، وكم كان عمره بالضبط؟",
+    "كم هدفًا سجل مبابي بقدمه اليمنى عندما وصل إلى 201 هدف مع باريس؟",
+    "وكم هدفًا بقدمه اليسرى؟",
+    "وكم هدفًا بالرأس؟",
+    "من اللاعب الذي سجل 41 هدفًا في 46 مباراة مع باريس في موسم 2013/14؟",
+    "من اللاعب الذي سجل 49 هدفًا في 50 مباراة في موسم 2016/17؟",
+    "ما الموسم الذي سجل فيه باريس أكبر عدد من الأهداف في موسم واحد بين المواسم المذكورة رسميًا، وكم هدفًا؟",
+    "من اللاعب الذي أصبح أكثر لاعب تحقيقًا للبطولات في تاريخ باريس، وكم بطولة كان يملك عند تحديث النادي عام 2022؟",
+    "سؤال الوحش: كم مرة وصل باريس إلى نهائي دوري أبطال أوروبا حتى نهاية موسم 2025/26، وما نتائج النهائيات؟"
+  ]
+};
+
+function parseBankImport(raw){
+  const out = { easy:[], medium:[], hard:[], impossible:[] };
+  const lines = (raw||'').split('\n');
+  let current = null;
+  let inFence = false;
+  let buf = [];
+  for(const line of lines){
+    const trimmed = line.trim();
+    if(trimmed.startsWith('```')){
+      if(!inFence){ inFence = true; buf = []; }
+      else{
+        inFence = false;
+        const q = buf.join('\n').trim();
+        if(q && current) out[current].push(q);
+      }
+      continue;
+    }
+    if(inFence){ buf.push(line); continue; }
+    // header detection — order matters: check the more specific words first
+    if(/مستحيل/.test(trimmed)) current = 'impossible';
+    else if(/صعب/.test(trimmed)) current = 'hard';
+    else if(/متوسط|وسط/.test(trimmed)) current = 'medium';
+    else if(/سهل/.test(trimmed)) current = 'easy';
+  }
+  return out;
 }
 
 function screenAdminMatch(){
@@ -1811,6 +2054,96 @@ function bindEvents(){
     document.getElementById('newCode').placeholder = v;
   };
 
+  // question bank: switch tab
+  document.querySelectorAll('[data-bank-tab]').forEach(b=>{
+    b.onclick = ()=>{ UI._bankTab = b.getAttribute('data-bank-tab'); render(); };
+  });
+
+  // question bank: one-tap seed from the built-in question set (no paste needed at all)
+  const bankSeedBtn = document.getElementById('bankSeedBtn');
+  if(bankSeedBtn) bankSeedBtn.onclick = async ()=>{
+    let added=0, skippedDupe=0, skippedFull=0;
+    await mutate(s=>{
+      STATE = s;
+      ['easy','medium','hard','impossible'].forEach(diff=>{
+        const existing = new Set(s.questionBank[diff]);
+        SEED_QUESTIONS[diff].forEach(q=>{
+          if(s.questionBank[diff].length >= BANK_CAP){ skippedFull++; return; }
+          if(existing.has(q)){ skippedDupe++; return; }
+          s.questionBank[diff].push(q);
+          existing.add(q);
+          added++;
+        });
+      });
+    });
+    showAlert(`تمت تعبئة البنك: ${added} سؤال جديد.` + (skippedDupe? ` (${skippedDupe} كانوا موجودين مسبقاً فتم تجاهلهم)` : ''));
+    render();
+  };
+
+  // question bank: bulk import (auto-detects section per question from headers)
+  const bankImportBtn = document.getElementById('bankImportBtn');
+  if(bankImportBtn) bankImportBtn.onclick = async ()=>{
+    const box = document.getElementById('bankImportBox');
+    const parsed = parseBankImport(box ? box.value : '');
+    const totalFound = Object.values(parsed).reduce((a,b)=>a+b.length,0);
+    if(totalFound===0){ showAlert('لم يتم التعرف على أي سؤال في النص الملصق. تأكد أن كل سؤال داخل بلوك كود ```مثل هذا``` وأن فوقه عنوان يذكر مستوى الصعوبة.'); return; }
+    let added=0, skippedDupe=0, skippedFull=0;
+    await mutate(s=>{
+      STATE = s;
+      ['easy','medium','hard','impossible'].forEach(diff=>{
+        const existing = new Set(s.questionBank[diff]);
+        parsed[diff].forEach(q=>{
+          if(s.questionBank[diff].length >= BANK_CAP){ skippedFull++; return; }
+          if(existing.has(q)){ skippedDupe++; return; }
+          s.questionBank[diff].push(q);
+          existing.add(q);
+          added++;
+        });
+      });
+    });
+    if(box) box.value='';
+    showAlert(`تم استيراد ${added} سؤال جديد.` + (skippedDupe? ` تم تجاهل ${skippedDupe} سؤال مكرر بالفعل.` : '') + (skippedFull? ` تم تجاهل ${skippedFull} سؤال لامتلاء القسم (100/100).` : ''));
+    render();
+  };
+
+  // question bank: manual add to current tab (one line = one question)
+  const bankManualAddBtn = document.getElementById('bankManualAddBtn');
+  if(bankManualAddBtn) bankManualAddBtn.onclick = async ()=>{
+    const diff = bankManualAddBtn.getAttribute('data-diff');
+    const box = document.getElementById('bankManualBox');
+    const lines = (box? box.value : '').split('\n').map(l=>l.trim()).filter(Boolean);
+    if(!lines.length) return;
+    let added=0, skippedDupe=0, skippedFull=0;
+    await mutate(s=>{
+      STATE = s;
+      const existing = new Set(s.questionBank[diff]);
+      lines.forEach(q=>{
+        if(s.questionBank[diff].length >= BANK_CAP){ skippedFull++; return; }
+        if(existing.has(q)){ skippedDupe++; return; }
+        s.questionBank[diff].push(q);
+        existing.add(q);
+        added++;
+      });
+    });
+    if(box) box.value='';
+    if(skippedDupe || skippedFull){
+      showAlert(`تمت إضافة ${added} سؤال.` + (skippedDupe? ` تم تجاهل ${skippedDupe} مكرر.` : '') + (skippedFull? ` تم تجاهل ${skippedFull} لامتلاء القسم.` : ''));
+    }
+    render();
+  };
+
+  // question bank: delete a single question
+  document.querySelectorAll('.bank-del-btn').forEach(b=>{
+    b.onclick = ()=>{
+      const diff = b.getAttribute('data-diff');
+      const idx = parseInt(b.getAttribute('data-idx'));
+      showConfirm('حذف هذا السؤال من البنك نهائياً؟', async ()=>{
+        await mutate(s=>{ STATE=s; s.questionBank[diff].splice(idx,1); });
+        render();
+      });
+    };
+  });
+
   const saveTeamsBtn = document.getElementById('saveTeamsBtn');
   if(saveTeamsBtn) saveTeamsBtn.onclick = async ()=>{
     const inputs = document.querySelectorAll('.teamname-input');
@@ -1842,6 +2175,27 @@ function bindEvents(){
   document.querySelectorAll('[data-round]').forEach(b=>{
     b.onclick = ()=>{ STATE.league.currentRound = parseInt(b.getAttribute('data-round')); render(); };
   });
+
+  const autoFillBtn = document.getElementById('autoFillRoundBtn');
+  if(autoFillBtn) autoFillBtn.onclick = async ()=>{
+    const r = parseInt(autoFillBtn.getAttribute('data-round'));
+    showConfirm('سيتم ملء الخانات الفارغة فقط في هذه الجولة من بنك الأسئلة (المباريات المكتملة أساساً لن تتأثر). متابعة؟', async ()=>{
+      let report;
+      await mutate(s=>{
+        STATE = s;
+        report = autoFillRoundQuestions(s.league.rounds[r-1] || []);
+      });
+      const u = report.used, sh = report.shortage;
+      const usedTotal = u.easy+u.medium+u.hard+u.impossible;
+      const shortageTotal = sh.easy+sh.medium+sh.hard+sh.impossible;
+      let msg = `تم ملء ${report.matchesTouched} مباراة — استُخدم ${usedTotal} سؤال (سهل: ${u.easy}، وسط: ${u.medium}، صعب: ${u.hard}، مستحيل: ${u.impossible}).`;
+      if(shortageTotal){
+        msg += ` نفدت أسئلة قسم: ` + Object.entries(sh).filter(([,v])=>v>0).map(([k,v])=>`${DIFF_META[k].label} (${v} خانة فاضية)`).join('، ') + '. زوّد البنك من شاشة بنك الأسئلة.';
+      }
+      showAlert(msg);
+      render();
+    });
+  };
 
   // match rows -> open match (questions or grading)
   document.querySelectorAll('[data-match]').forEach(row=>{
@@ -2134,6 +2488,12 @@ document.addEventListener('click', function(e){
   setInterval(async ()=>{
     if(document.getElementById('answerBox')) return; // don't yank state while someone is mid-answer
     if(IS_MUTATING) return; // don't read while a save is in flight — avoids racing/overwriting it
+    // don't yank state while the founder is on the "write questions" screen — that screen has
+    // several textareas, and a poll landing in the split-second between leaving one field and
+    // focusing the next (no field focused yet) used to wipe every unsaved question, not just
+    // the one being edited. Nobody else is on this screen concurrently, so there's nothing to
+    // sync live here anyway — it's safe to just skip refreshing until the founder saves/leaves.
+    if(UI.screen === 'admin-match') return;
     // don't yank state (and wipe what's typed) while the user is actively focused on ANY
     // text field — forum message, participant names, admin codes, question text, etc.
     // This covers every current and future input without having to list each id here.
