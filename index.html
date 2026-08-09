@@ -526,8 +526,10 @@ function mutate(fn){
       // dependency between them — running them in parallel (instead of one after the other)
       // roughly halves the time a save takes, with no change in what gets saved or recovered.
       const serialized = JSON.stringify(STATE);
-      await Promise.all([backupState(), saveState()]);
-      LAST_KNOWN_STATE_JSON = serialized; // keep the background poll's "did anything change" check in sync
+      const results = await Promise.all([backupState(), saveState()]);
+      const saved = results[1] !== false; // saveState() returns false (and shows its own alert) if it truly failed
+      if(saved) LAST_KNOWN_STATE_JSON = serialized; // keep the background poll's "did anything change" check in sync
+      return saved;
     } finally {
       IS_MUTATING = false;
     }
@@ -1227,6 +1229,7 @@ function screenPlay(){
     <div class="qtext">${q.text? q.text : '(لم يكتب المؤسس نص هذا السؤال بعد)'}</div>
     <label>إجابتك</label>
     <textarea id="answerBox" placeholder="اكتب إجابتك هنا..."></textarea>
+    <div class="sub" id="savingNote" style="visibility:hidden">⏳ جارٍ حفظ إجابتك، يرجى الانتظار...</div>
     <button class="btn btn-primary" id="submitAnswerBtn">إرسال الإجابة والانتقال للتالي</button>
   </div>`;
 }
@@ -2070,14 +2073,15 @@ function bindEvents(){
     UI.screen='home'; render();
   };
 
-  // voice-recording consent (anti-cheat) — required once per team before their first question
+  // voice-recording consent (anti-cheat notice) — required once per team before their first
+  // question. This flag is purely local/display-only (nothing is ever actually recorded or
+  // uploaded, see startVoiceRecording below), so we set it directly in memory and move on
+  // immediately instead of round-tripping to the server first — that round trip is what used
+  // to make "أوافق وأبدأ" sit there for several seconds before anything happened.
   const voiceConsentBtn = document.getElementById('voiceConsentBtn');
-  if(voiceConsentBtn) voiceConsentBtn.onclick = async ()=>{
-    await mutate(s=>{
-      STATE = s;
-      const t = s.teams.find(x=>x.id===MY_TEAM);
-      if(t) t.voiceConsent = true;
-    });
+  if(voiceConsentBtn) voiceConsentBtn.onclick = ()=>{
+    const t = STATE.teams.find(x=>x.id===MY_TEAM);
+    if(t) t.voiceConsent = true;
     render();
   };
 
@@ -2656,31 +2660,37 @@ async function submitCurrentAnswer(){
   const matchId = UI._matchId, side = UI._side, qi = UI._qi;
   await stopVoiceRecordingAndSave(matchId, qi, side);
 
-  // Optimistic local update: apply the exact same change to the in-memory STATE first and
-  // render immediately, instead of waiting on the network round-trip to move to the next
-  // question. This is what removes the "tap submit and the app just sits there" delay —
-  // the button now advances the moment it's tapped, every time, with no wait.
-  const localMatch = findMatchById(matchId);
-  if(localMatch) localMatch.questions[qi][side].text = text;
-  render();
+  // Block moving to the next question until this answer is actually confirmed saved on the
+  // server (show a "saving, please wait" note instead). We deliberately do NOT advance
+  // optimistically here anymore: with fast consecutive submits, an earlier question's save
+  // could finish (and re-render) AFTER a later question's save/render already happened,
+  // which was making the question number visibly jump backward and then forward again.
+  // Waiting for each save to be confirmed before moving on removes that race entirely.
+  const submitBtn = document.getElementById('submitAnswerBtn');
+  const savingNote = document.getElementById('savingNote');
+  if(submitBtn){ submitBtn.disabled = true; submitBtn.textContent = 'جارٍ حفظ إجابتك...'; }
+  if(savingNote) savingNote.style.visibility = 'visible';
+  if(box) box.disabled = true;
 
-  // Persist for real, in the background. mutate() re-fetches the latest shared state first
-  // (so it can't clobber anything anyone else saved meanwhile) and re-applies this same
-  // answer on top of that fresh copy — the actual saved data is unaffected by the optimistic
-  // step above, which only exists to make the screen feel instant.
-  await mutate(s=>{
+  const saved = await mutate(s=>{
     STATE = s;
     const m = findMatchById(matchId);
     if(m) m.questions[qi][side].text = text;
   });
 
-  // Re-sync the screen with the authoritative saved state once the save lands — but never if
-  // the person has already started typing into whatever came next; same rule the background
-  // poller follows, so this never yanks text out from under someone mid-answer.
-  const active = document.activeElement;
-  const typing = active && document.body.contains(active) &&
-    (active.tagName==='INPUT' || active.tagName==='TEXTAREA' || active.isContentEditable);
-  if(!typing) render();
+  if(!saved){
+    // Save genuinely failed (e.g. no network): stay on this exact question so the person can
+    // just re-answer/resend it, instead of silently losing the answer or jumping ahead.
+    if(submitBtn){ submitBtn.disabled = false; submitBtn.textContent = 'إرسال الإجابة والانتقال للتالي'; }
+    if(savingNote) savingNote.style.visibility = 'hidden';
+    if(box) box.disabled = false;
+    startPlayTimer();
+    showAlert('عذراً، لم يتم حفظ إجابة السؤال رقم '+(qi+1)+'. أعد إرسالها بعد التأكد من اتصال النت.');
+    return;
+  }
+
+  // Saved for real — now it's safe to move on to whichever question is actually next.
+  render();
 }
 
 /* ---------------- boot ---------------- */
