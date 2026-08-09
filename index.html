@@ -480,41 +480,32 @@ async function saveState(){
   showAlert('تعذر الحفظ، حاول مرة أخرى');
   return false;
 }
-// re-fetch latest shared state, apply a mutation function, then save (reduces write collisions).
-// Queued/serialized: if you tap several buttons quickly, each mutation waits its turn instead of
-// racing the previous one — that race was causing occasional false "save failed" messages.
+// Apply a mutation function to the in-memory STATE, then save. Queued/serialized: if you tap
+// several buttons quickly, each mutation waits its turn instead of racing the previous one.
 //
-// SAFETY: if the pre-mutation re-fetch fails, we ABORT the whole mutation instead of running
-// it against whatever STATE happens to be in memory (which could be a stale/blank default).
-// This is the fix for the bug that wiped the tournament: a transient read failure used to
-// silently fall through to fn(STATE) running on a blank state, and the blank result got
-// saved right over the real data.
-//
-// NOTE: this abort must fire on ANY unconfirmed read failure — it must NOT depend on whether
-// the page's very first load happened to succeed earlier in the session. The previous version
-// only aborted "if FIRST_LOAD_OK" was true, which meant that the one case that actually
-// mattered — the first load having already failed, so STATE was already a fabricated blank —
-// was exactly the case where this guard did nothing, and the blank state got saved for real.
-// A pre-read that comes back err.notFound (confirmed no document exists) is the one and only
-// safe case to proceed on with a fresh/blank state; every other failure aborts, always.
+// SAFETY: if the very first load of the app failed (FIRST_LOAD_OK is false), STATE may just be
+// a fabricated blank default — we ABORT instead of saving that over real data. Once the first
+// load has succeeded, our in-memory STATE stays authoritative: it's set on boot, updated after
+// every one of our own successful saves, and refreshed by the background poll in boot() whenever
+// something else (another device) changes the shared data. See mutate()'s inline note for why we
+// deliberately stopped re-fetching from the server before every single mutation.
 function mutate(fn){
   const run = SAVE_QUEUE.then(async ()=>{
     IS_MUTATING = true;
     try{
-      let readOk = false;
-      try{
-        const r = await window.storage.get('tournament', true);
-        if(r && r.value){ STATE = JSON.parse(r.value); }
-        readOk = true;
-      }catch(e){
-        if(e && e.notFound){
-          // confirmed: genuinely no tournament document yet — safe to proceed and create one
-          readOk = true;
-        } else {
-          console.error('mutate: pre-read failed, aborting to avoid data loss', e);
-        }
-      }
-      if(!readOk){
+      // NOTE: this used to re-fetch 'tournament' from the server before every single
+      // mutation, then overwrite STATE with whatever came back. That was meant to reduce
+      // write collisions between two different devices — but SAVE_QUEUE already serializes
+      // every mutate() call from *this* tab, so on fast consecutive submits (e.g. answering
+      // question 8 then immediately question 9) the re-fetch could land on a copy of
+      // 'tournament' that hadn't caught up with the write we had just finished a moment
+      // earlier. That stale copy would then get question 9's answer applied on top of it and
+      // saved back — silently erasing question 8's already-saved answer and making the app
+      // jump back to question 8. Our in-memory STATE is already the authoritative, fully
+      // up-to-date copy immediately after our own successful save (and is kept in sync the
+      // rest of the time by the background poll in boot()), so we mutate it directly instead
+      // of re-fetching. This also removes an extra network round trip, so saving is faster.
+      if(!FIRST_LOAD_OK){
         showAlert('تعذر التحقق من آخر نسخة محفوظة قبل الحفظ. لم يتم إجراء أي تعديل — تأكد من اتصال النت وحاول مرة أخرى.');
         return;
       }
@@ -1220,11 +1211,13 @@ function screenPlay(){
   UI._matchId = match.id; UI._side = side; UI._qi = qi;
   const q = match.questions[qi];
   const roundBanner = stageDeadlineBanner(match);
-  return `<div class="back" data-go="home">→ رجوع</div>
-  <div class="card">
+  // No "back" link here on purpose: once a team has entered its questions, it must answer
+  // all of them before it can leave this screen (see sideDone() card above, which is the
+  // only exit and is the one that shows "→ رجوع"). This stops the exit->re-enter loop that
+  // used to reset the per-question timer/indicator over and over.
+  return `<div class="card">
     ${roundBanner}
     <div class="qnum">${PHASE_LABEL[match.phase]||''} · ${teamName(MY_TEAM)} ضد ${teamName(otherTeam)} · سؤال ${qi+1} من ${match.questions.length} ${diffBadge(q.difficulty)}</div>
-    <div class="rec-indicator" id="recIndicator" style="visibility:hidden"><span class="mic-ring">🎙</span> جارٍ تسجيل الصوت</div>
     <div class="timer" id="playTimer">20</div>
     <div class="qtext">${q.text? q.text : '(لم يكتب المؤسس نص هذا السؤال بعد)'}</div>
     <label>إجابتك</label>
@@ -2623,14 +2616,14 @@ async function finalizeDraw(){
    valid approach for that, but it depends on a storage backend to actually save clips). */
 function startVoiceRecording(){
   VOICE_READY = Promise.resolve(false); // never claims a real recording exists
-  const ind = document.getElementById('recIndicator');
-  if(ind) ind.style.visibility = 'visible';
+  // The per-question "جارٍ تسجيل الصوت" badge was removed: the anti-cheat notice is now
+  // shown once, on the consent screen, before the first question — not repeated on every
+  // single question. This function is kept (and still called from bindEvents) so nothing
+  // else needs to change if a maintainer wires in a real recorder later.
 }
 // no-op: nothing was recorded, so there is nothing to stop/save. Kept as an async
 // function so existing call sites (submitCurrentAnswer) don't need to change.
 async function stopVoiceRecordingAndSave(matchId, qi, side){
-  const ind = document.getElementById('recIndicator');
-  if(ind) ind.style.visibility = 'hidden';
 }
 
 function startPlayTimer(){
@@ -2656,7 +2649,7 @@ function startPlayTimer(){
 async function submitCurrentAnswer(){
   clearInterval(PLAY_TIMER);
   const box = document.getElementById('answerBox');
-  const text = (box ? box.value.trim() : '') || '(بدون إجابة)';
+  const text = (box ? box.value.trim() : '') || 'لم يجب';
   const matchId = UI._matchId, side = UI._side, qi = UI._qi;
   await stopVoiceRecordingAndSave(matchId, qi, side);
 
