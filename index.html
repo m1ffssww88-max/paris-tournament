@@ -32,18 +32,30 @@ body{
   min-height:100vh;
   -webkit-font-smoothing:antialiased;
 }
-.wrap{max-width:640px;margin:0 auto;padding:18px 16px 60px;position:relative}
+.wrap{max-width:640px;width:100%;margin:0 auto;padding:18px 16px 60px;position:relative}
+/* Keep the same layout/design on every device — phone, tablet, laptop — just scale the
+   available reading column and a few text/icon sizes gently between them instead of
+   stretching a fixed mobile layout wide or leaving a huge column narrow. */
+@media (min-width:720px){
+  .wrap{max-width:680px;padding:24px 20px 70px}
+}
+@media (min-width:1024px){
+  .wrap{max-width:720px;padding:32px 24px 80px}
+}
+@media (max-width:360px){
+  .wrap{padding:14px 10px 50px}
+}
 
 /* ---------- Header / brand ---------- */
 .brandbar{display:flex;align-items:center;gap:12px;padding:14px 4px 20px;justify-content:center}
 .badge{
-  width:52px;height:52px;border-radius:15px;
+  width:clamp(44px,11vw,52px);height:clamp(44px,11vw,52px);border-radius:15px;
   display:flex;align-items:center;justify-content:center;
   box-shadow:0 6px 20px rgba(0,0,0,.4);
   flex-shrink:0;overflow:hidden;
 }
 .badge img{width:100%;height:100%;object-fit:cover;display:block}
-.brand-name{font-weight:900;font-size:26px;line-height:1}
+.brand-name{font-weight:900;font-size:clamp(21px,5.5vw,26px);line-height:1}
 .brand-name .b1{color:#5B9BFF}
 .brand-name .b2{color:var(--red-2)}
 .brand-tagline{font-size:11px;color:var(--mute);letter-spacing:.5px;margin-top:2px}
@@ -92,19 +104,19 @@ input[type=text],input[type=password],input[type=number],textarea,select{
 textarea{resize:vertical;min-height:56px}
 label{font-size:12.5px;color:var(--mute);display:block;margin-bottom:4px}
 
-.pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700}
+.pill{display:inline-block;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700;line-height:1.5;text-align:center;white-space:normal;flex-shrink:0;max-width:100%}
 .pill-wait{background:rgba(242,179,61,.15);color:var(--gold)}
 .pill-half{background:rgba(91,155,255,.15);color:#8fb4ff}
 .pill-ready{background:rgba(37,178,106,.18);color:#4be09b}
 .pill-done{background:rgba(255,255,255,.08);color:var(--mute)}
 
 .match-row{
-  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;
   padding:11px 12px;border-radius:12px;background:#0a1730;border:1px solid var(--line);
   margin-bottom:8px;cursor:pointer;
 }
 .match-row:hover{border-color:rgba(255,255,255,.2)}
-.teams{font-size:13.5px;font-weight:700}
+.teams{font-size:13.5px;font-weight:700;min-width:0;overflow-wrap:break-word}
 .teams .vs{color:var(--mute);font-weight:400;margin:0 6px}
 .teams .win{color:var(--gold)}
 
@@ -117,12 +129,12 @@ label{font-size:12.5px;color:var(--mute);display:block;margin-bottom:4px}
 .topnav button.active{background:linear-gradient(135deg,var(--red),#b5122c);color:white;border-color:transparent}
 
 .timer{
-  font-family:'Roboto Mono',monospace;font-weight:700;font-size:34px;text-align:center;
+  font-family:'Roboto Mono',monospace;font-weight:700;font-size:clamp(28px,8vw,34px);text-align:center;
   color:var(--gold);margin:4px 0 14px;
 }
 .timer.low{color:var(--red-2)}
 .qnum{color:var(--mute);font-size:12px;letter-spacing:.5px;text-transform:uppercase;margin-bottom:2px}
-.qtext{font-size:18px;font-weight:700;margin-bottom:14px;line-height:1.5}
+.qtext{font-size:clamp(16px,4.4vw,18px);font-weight:700;margin-bottom:14px;line-height:1.5}
 
 .standrow{display:flex;align-items:center;gap:10px;padding:9px 8px;border-bottom:1px solid var(--line);font-size:13.5px}
 .standrow .rank{width:22px;font-weight:900;color:var(--mute)}
@@ -396,6 +408,9 @@ function playTimeUpSound(){ beep(220, .35, .08, 'sawtooth'); }
 /* ---------------- storage helpers ---------------- */
 let SAVE_QUEUE = Promise.resolve(); // serializes all writes so concurrent clicks/polling can't race each other
 let IS_MUTATING = false;
+// last-saved serialized STATE we know the server has. Used purely to detect whether the
+// background poll actually needs to touch the screen — see the setInterval in boot().
+let LAST_KNOWN_STATE_JSON = null;
 
 // IMPORTANT: window.storage.get() throws BOTH when a key genuinely doesn't exist yet
 // AND when the read fails for a transient reason (network blip, offline, permission
@@ -432,6 +447,9 @@ async function loadState(){
   }
   ensureForum(STATE);
   ensureQuestionBank(STATE);
+  ensureSettings(STATE);
+  // baseline for the background poll's "did the server copy actually change" check
+  LAST_KNOWN_STATE_JSON = JSON.stringify(STATE);
   try{
     const m = await window.storage.get('my_team', false);
     MY_TEAM = m && m.value ? JSON.parse(m.value) : null;
@@ -502,11 +520,14 @@ function mutate(fn){
       }
       ensureForum(STATE);
       ensureQuestionBank(STATE);
+      ensureSettings(STATE);
       fn(STATE);
       // backup + real save both write the same freshly-mutated STATE, so there's no ordering
       // dependency between them — running them in parallel (instead of one after the other)
       // roughly halves the time a save takes, with no change in what gets saved or recovered.
+      const serialized = JSON.stringify(STATE);
       await Promise.all([backupState(), saveState()]);
+      LAST_KNOWN_STATE_JSON = serialized; // keep the background poll's "did anything change" check in sync
     } finally {
       IS_MUTATING = false;
     }
@@ -539,7 +560,10 @@ async function restoreFromUploadedState(parsedState){
       STATE = parsedState;
       ensureForum(STATE);
       ensureQuestionBank(STATE);
+      ensureSettings(STATE);
+      const serialized = JSON.stringify(STATE);
       await Promise.all([backupState(), saveState()]);
+      LAST_KNOWN_STATE_JSON = serialized;
     } finally {
       IS_MUTATING = false;
     }
@@ -587,7 +611,8 @@ function defaultState(){
     sf:{ matches:[], startedAt:null },
     final:{ match:null, startedAt:null },
     champion:null,
-    questionBank:{ easy:[], medium:[], hard:[], impossible:[] }
+    questionBank:{ easy:[], medium:[], hard:[], impossible:[] },
+    settings:{ standingsHidden:false }
   };
 }
 
@@ -861,6 +886,15 @@ function ensureQuestionBank(s){
   });
 }
 
+// migration helper for tournaments saved before the "settings" object existed —
+// same pattern as ensureForum/ensureQuestionBank, so old saved states just gain the
+// field (defaulting the standings table to visible) without touching anything else.
+function ensureSettings(s){
+  if(!s) return;
+  if(!s.settings) s.settings = { standingsHidden:false };
+  if(typeof s.settings.standingsHidden !== 'boolean') s.settings.standingsHidden = false;
+}
+
 async function loadForumLastRead(){
   try{
     const r = await window.storage.get('forum_last_read', false);
@@ -1026,9 +1060,21 @@ function renderBrand(){
 async function render(){
   const app = document.getElementById('app');
   const scrollY = window.scrollY; // preserve scroll position (e.g. mid-way through grading a long list)
+  // Replacing app.innerHTML destroys and recreates every DOM node inside it, which also
+  // resets the scroll position of any independently-scrollable inner container (the
+  // horizontal-scrolling bracket tree, the round-tabs strip) back to 0. Capture those
+  // before the rebuild and restore them after, on top of the normal page scroll — this is
+  // what stops a background refresh from visibly "jumping" the screen around.
+  const scrollables = Array.from(document.querySelectorAll('.bracket-tree, .topnav'));
+  const scrollState = scrollables.map(el=>({sel: el.className+'|'+el.id, left: el.scrollLeft}));
   app.innerHTML = renderBrand() + await bodyFor(UI.screen) + renderModal();
   bindEvents();
   window.scrollTo(0, scrollY);
+  const newScrollables = Array.from(document.querySelectorAll('.bracket-tree, .topnav'));
+  newScrollables.forEach((el,i)=>{
+    const prev = scrollState[i];
+    if(prev && prev.sel === (el.className+'|'+el.id)) el.scrollLeft = prev.left;
+  });
   if(UI.screen==='forum') markForumRead(); // fire-and-forget, clears the mention badge
 }
 
@@ -1083,7 +1129,7 @@ function screenHome(){
     <button class="btn btn-gold" data-go="forum">منتدى الهياط <span class="ico ico-red">🔥</span>${myUnreadMentions().length? '<span class="badge-dot"></span>':''}</button>
   </div>` : ''}
   <div class="btn-row mb14">
-    <button class="btn btn-ghost" data-go="standings">الترتيب <span class="ico ico-blue">📊</span></button>
+    ${STATE.settings && STATE.settings.standingsHidden ? '' : `<button class="btn btn-ghost" data-go="standings">الترتيب <span class="ico ico-blue">📊</span></button>`}
     <button class="btn btn-ghost" data-go="bracket">مخطط البطولة <span class="ico ico-gold">🏆</span></button>
   </div>
   <div class="card">
@@ -1187,6 +1233,12 @@ function screenPlay(){
 
 function screenStandings(){
   if(STATE.stage==='setup') return `<div class="back" data-go="home">→ رجوع</div><div class="empty">لا يوجد ترتيب بعد، البطولة لم تبدأ.</div>`;
+  // hidden temporarily by the founder (toggle, not deletion) — the league table itself, all
+  // matches and points, keeps being computed and saved normally in the background; only this
+  // screen is blocked for regular participants until the founder switches it back on.
+  if(STATE.settings && STATE.settings.standingsHidden && !UI._isAdmin){
+    return `<div class="back" data-go="home">→ رجوع</div><div class="empty">📊 الترتيب مخفي مؤقتاً من قبل المؤسس، سيعود قريباً.</div>`;
+  }
   const st = computeStandings();
   const rows = st.map((t,i)=>{
     const zoneCls = i<8 ? 'q-direct' : (i<24 ? 'q-playoff' : 'q-out');
@@ -1443,6 +1495,12 @@ function screenAdminHome(){
     <label class="mt14">اسمك في المنتدى (يُستخدم للإشارة إليك، مثل @${STATE.founderHandle})</label>
     <input type="text" id="newFounderHandle" placeholder="${STATE.founderHandle}">
     <button class="btn btn-ghost btn-sm" id="saveFounderHandleBtn">حفظ الاسم</button>
+    <hr class="line">
+    <label>جدول الترتيب</label>
+    <div class="sub" style="margin-top:-4px">إخفاء مؤقت فقط — الجدول والنتائج تبقى محفوظة وتتحدث بالخلفية بشكل طبيعي، فقط الشاشة تختفي عن المشاركين لحين إعادة تفعيلها.</div>
+    <button class="btn ${STATE.settings && STATE.settings.standingsHidden ? 'btn-green' : 'btn-ghost'}" id="toggleStandingsBtn">
+      ${STATE.settings && STATE.settings.standingsHidden ? '👁️ إظهار الترتيب للمشاركين' : '🙈 إخفاء الترتيب مؤقتاً عن المشاركين'}
+    </button>
   </div>`;
 }
 
@@ -2167,6 +2225,17 @@ function bindEvents(){
     document.getElementById('newCode').placeholder = v;
   };
 
+  // toggle (not delete) the standings screen for regular participants — the league
+  // table keeps computing and saving normally the whole time, only the screen is hidden
+  const toggleStandingsBtn = document.getElementById('toggleStandingsBtn');
+  if(toggleStandingsBtn) toggleStandingsBtn.onclick = async ()=>{
+    await mutate(s=>{
+      ensureSettings(s);
+      s.settings.standingsHidden = !s.settings.standingsHidden;
+    });
+    render();
+  };
+
   // question bank: switch tab
   document.querySelectorAll('[data-bank-tab]').forEach(b=>{
     b.onclick = ()=>{ UI._bankTab = b.getAttribute('data-bank-tab'); render(); };
@@ -2586,12 +2655,32 @@ async function submitCurrentAnswer(){
   const text = (box ? box.value.trim() : '') || '(بدون إجابة)';
   const matchId = UI._matchId, side = UI._side, qi = UI._qi;
   await stopVoiceRecordingAndSave(matchId, qi, side);
+
+  // Optimistic local update: apply the exact same change to the in-memory STATE first and
+  // render immediately, instead of waiting on the network round-trip to move to the next
+  // question. This is what removes the "tap submit and the app just sits there" delay —
+  // the button now advances the moment it's tapped, every time, with no wait.
+  const localMatch = findMatchById(matchId);
+  if(localMatch) localMatch.questions[qi][side].text = text;
+  render();
+
+  // Persist for real, in the background. mutate() re-fetches the latest shared state first
+  // (so it can't clobber anything anyone else saved meanwhile) and re-applies this same
+  // answer on top of that fresh copy — the actual saved data is unaffected by the optimistic
+  // step above, which only exists to make the screen feel instant.
   await mutate(s=>{
     STATE = s;
     const m = findMatchById(matchId);
     if(m) m.questions[qi][side].text = text;
   });
-  render(); // will move to next question or show waiting screen
+
+  // Re-sync the screen with the authoritative saved state once the save lands — but never if
+  // the person has already started typing into whatever came next; same rule the background
+  // poller follows, so this never yanks text out from under someone mid-answer.
+  const active = document.activeElement;
+  const typing = active && document.body.contains(active) &&
+    (active.tagName==='INPUT' || active.tagName==='TEXTAREA' || active.isContentEditable);
+  if(!typing) render();
 }
 
 /* ---------------- boot ---------------- */
@@ -2642,9 +2731,22 @@ document.addEventListener('click', function(e){
     }
     try{
       const r = await window.storage.get('tournament', true);
-      if(r && r.value) STATE = JSON.parse(r.value);
-      await checkForfeitsAndSave();
-      render();
+      // Only touch STATE/re-render if the shared data actually changed since our last known
+      // copy. This is the main fix for the "keeps refreshing/rebuilding every few seconds"
+      // complaint: previously this poll called render() unconditionally every 8s even when
+      // nothing on the server had changed, which rebuilt (and visibly jumped) the whole
+      // screen for no reason.
+      const incoming = r && r.value ? r.value : null;
+      let needsRender = false;
+      if(incoming !== null && incoming !== LAST_KNOWN_STATE_JSON){
+        STATE = JSON.parse(incoming);
+        LAST_KNOWN_STATE_JSON = incoming;
+        needsRender = true;
+      }
+      const beforeForfeitSweep = LAST_KNOWN_STATE_JSON;
+      await checkForfeitsAndSave(); // mutate() updates LAST_KNOWN_STATE_JSON itself if it actually saved a change
+      if(LAST_KNOWN_STATE_JSON !== beforeForfeitSweep) needsRender = true;
+      if(needsRender) render();
     }catch(e){}
   }, 8000);
 })();
