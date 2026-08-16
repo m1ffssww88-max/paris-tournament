@@ -2063,9 +2063,9 @@ function screenAdminKnockout(){
   <div class="card">
     <h2>${PHASE_LABEL[stage]}</h2>
     ${deadlineBannerFromStart(startedAt, canAdvance)}
+    ${list.length ? `<button class="btn btn-ghost mb8" data-rearrange-knockout="${stage}">🔀 تعديل المواجهات (استبدال المتسابقين)</button>` : ''}
     <div class="sub">اضغط على مباراة لكتابة الأسئلة أو التصحيح. لا يستطيع المشاركون الإجابة حتى تُفعّل عدّاد الـ24 ساعة لهذا الدور.</div>
     ${rows || '<div class="empty">لا توجد مباريات هنا بعد</div>'}
-    ${list.length ? `<button class="btn btn-ghost mt14" data-rearrange-knockout="${stage}">🔀 تعديل المواجهات (استبدال المتسابقين)</button>` : ''}
     ${!startedAt ? `<button class="btn btn-ghost mt14" id="startStageBtn" data-stage="${stage}">تفعيل عدّاد 24 ساعة لهذا الدور</button>` : ''}
     ${advanceBtn}
   </div>`;
