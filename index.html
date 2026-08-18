@@ -360,6 +360,15 @@ let VOICE_STREAM = null;     // mic stream, kept so we can stop its tracks when 
 let VOICE_READY = null;      // promise that resolves once the recorder has actually started
 const ADMIN_RECOVERY_CODE = '56667gfdsa'; // fixed backup admin code — never changes, even if adminCode is changed
 
+// ---------------- anti-cheat: detect leaving the tab/app during an active question ----------------
+// We can't block a participant from opening another app or window (no web page can), but we CAN
+// detect and log every time this tab loses visibility (tab switch, app switch, screen lock, minimize)
+// while they're mid-question, plus how long they were away, and surface that to the founder. The
+// question timer keeps running the whole time they're gone (we deliberately do NOT pause it), so
+// leaving still costs them real time — this is a detection/deterrent layer on top of that, not a
+// replacement for it.
+let TAB_HIDDEN_AT = null; // timestamp when the tab was last hidden while an active question was on screen
+
 /* ---------------- in-app modal (replaces native alert/confirm popups) ---------------- */
 function showAlert(message){ UI.modal = {type:'alert', message}; render(); }
 function showConfirm(message, onConfirm){ UI.modal = {type:'confirm', message, onConfirm}; render(); }
@@ -1203,6 +1212,7 @@ function screenPlay(){
           <li>ممنوع قراءة نص السؤال بصوت عالٍ أثناء التسجيل — اعتبار ذلك محاولة غش.</li>
           <li>يعمل التسجيل تلقائياً في الخلفية بدون أي إجراء إضافي منك.</li>
           <li>التسجيلات يراها المؤسس فقط، ويحذفها بعد المراجعة.</li>
+          <li>⚠️ يتم رصد أي خروج من هذه الصفحة (تبديل تطبيق، تصغير الشاشة، قفلها) أثناء أي سؤال، مع مدة الغياب، ويظهر ذلك تلقائياً عند المؤسس.</li>
         </ul>
       </div>
       <button class="btn btn-primary" id="voiceConsentBtn">أوافق وأبدأ <span class="ico ico-navy">🎙</span></button>
@@ -1977,10 +1987,15 @@ function screenAdminGrade(){
     const voiceBtn = (side)=> q[side].hasVoice
       ? `<button class="voice-btn has" data-voice-load="${m.id}:${i}:${side}">🎙 تشغيل التسجيل</button>`
       : `<span class="voice-btn" style="opacity:.4;cursor:default">🎙 لا يوجد تسجيل</span>`;
+    // anti-cheat: shows if/how many times this participant left the tab (switched app, minimized,
+    // locked screen) while this specific question was open, and total seconds spent away.
+    const leftBadge = (side)=> (q[side].leftCount>0)
+      ? `<span class="pill" style="background:rgba(225,27,60,.18);color:#ff8fa0;margin-inline-start:6px">🚩 خرج ${q[side].leftCount} مرة · ${q[side].leftSeconds||0} ثا</span>`
+      : '';
     return `<div class="grade-q" data-qi="${i}">
       <div class="qh">سؤال ${i+1}: ${q.text||'(بدون نص)'}</div>
       <div class="ans-block">
-        <div class="who">${teamName(m.teamA)}</div>
+        <div class="who">${teamName(m.teamA)} ${leftBadge('a')}</div>
         <div class="txt">${q.a.text || '—'}</div>
         ${voiceBtn('a')}
         <div class="voice-player" id="voicePlayer-${m.id}-${i}-a"></div>
@@ -1990,7 +2005,7 @@ function screenAdminGrade(){
         </div>
       </div>
       <div class="ans-block">
-        <div class="who">${teamName(m.teamB)}</div>
+        <div class="who">${teamName(m.teamB)} ${leftBadge('b')}</div>
         <div class="txt">${q.b.text || '—'}</div>
         ${voiceBtn('b')}
         <div class="voice-player" id="voicePlayer-${m.id}-${i}-b"></div>
@@ -2706,6 +2721,42 @@ function startVoiceRecording(){
 // function so existing call sites (submitCurrentAnswer) don't need to change.
 async function stopVoiceRecordingAndSave(matchId, qi, side){
 }
+
+// small non-blocking toast — deliberately NOT a full render(), so it doesn't reset the
+// in-progress timer/textarea for the current question.
+function showTabSwitchToast(secs){
+  const el = document.createElement('div');
+  el.textContent = '⚠️ تم رصد خروجك من الصفحة لمدة ' + secs + ' ثانية أثناء السؤال — سجّلنا ذلك ليراجعه المؤسس.';
+  el.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);background:#E11B3C;color:#fff;'
+    + 'padding:10px 16px;border-radius:10px;font-family:Cairo,sans-serif;font-weight:700;font-size:13px;'
+    + 'z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,.4);max-width:92vw;text-align:center';
+  document.body.appendChild(el);
+  setTimeout(()=>{ el.remove(); }, 6000);
+}
+
+// fires on every tab/app switch, minimize, or screen lock (standard Page Visibility API — works
+// across desktop and mobile browsers). Only acts while the participant is actually on an active
+// question (answerBox present), so it stays silent everywhere else in the app.
+document.addEventListener('visibilitychange', function(){
+  const onActiveQuestion = !!document.getElementById('answerBox');
+  if(document.hidden){
+    if(onActiveQuestion) TAB_HIDDEN_AT = Date.now();
+    return;
+  }
+  if(TAB_HIDDEN_AT === null) return;
+  const awaySecs = Math.max(1, Math.round((Date.now() - TAB_HIDDEN_AT) / 1000));
+  TAB_HIDDEN_AT = null;
+  if(!onActiveQuestion) return; // they left the question screen entirely in the meantime — nothing to log against
+  const mid = UI._matchId, qi = UI._qi, side = UI._side;
+  if(mid==null || qi==null || !side) return;
+  mutate(s=>{
+    STATE = s;
+    const m = findMatchById(mid);
+    const qs = m && m.questions[qi] && m.questions[qi][side];
+    if(qs){ qs.leftCount = (qs.leftCount||0) + 1; qs.leftSeconds = (qs.leftSeconds||0) + awaySecs; }
+  });
+  showTabSwitchToast(awaySecs);
+});
 
 function startPlayTimer(){
   clearInterval(PLAY_TIMER);
